@@ -517,9 +517,9 @@ if __name__ == "__main__":
     required = ["imap_host", "imap_port", "smtp_host", "smtp_port", "email", "password"]
     missing = [k for k in required if not cfg.get(k)]
     if missing:
-        print(f"Error: missing config: {', '.join(missing)}")
-        print("Run with --help for usage.")
-        sys.exit(1)
+        print(f"Warning: missing config: {', '.join(missing)}")
+        print("Run with --help for usage. Daemon will not start until configured.")
+        return
 
     print(f"Using account: {cfg['email']}")
     print(f"IMAP: {cfg['imap_host']}:{cfg['imap_port']}  SMTP: {cfg['smtp_host']}:{cfg['smtp_port']}")
