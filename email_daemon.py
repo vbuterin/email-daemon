@@ -278,8 +278,20 @@ def list_folders(cfg: dict) -> list[str]:
 
 async def poll_loop(cfg: dict, interval: int = POLL_INTERVAL) -> None:
     global _last_poll
-    folders_to_poll = cfg.get("poll_folders", "INBOX").split(",")
+    required = ["imap_host", "imap_port", "smtp_host", "smtp_port", "email", "password"]
     while True:
+        # Re-read config each iteration so credentials saved after startup are picked up
+        db_cfg = sqlite3.connect(DB_PATH)
+        cfg.update(get_config(db_cfg))
+        db_cfg.close()
+
+        missing = [k for k in required if not cfg.get(k)]
+        if missing:
+            print(f"[{datetime.now(timezone.utc).isoformat()}] Warning: not configured ({', '.join(missing)}) — skipping poll.")
+            await asyncio.sleep(interval)
+            continue
+
+        folders_to_poll = cfg.get("poll_folders", "INBOX").split(",")
         print(f"[{datetime.now(timezone.utc).isoformat()}] Polling mailbox…")
         db = sqlite3.connect(DB_PATH)
         total_new = 0
@@ -514,16 +526,10 @@ if __name__ == "__main__":
 
     db.close()
 
-    required = ["imap_host", "imap_port", "smtp_host", "smtp_port", "email", "password"]
-    missing = [k for k in required if not cfg.get(k)]
-    if missing:
-        print(f"Warning: missing config: {', '.join(missing)}")
-        print("Run with --help for usage. Daemon will not start until configured.")
-        return
-
-    print(f"Using account: {cfg['email']}")
-    print(f"IMAP: {cfg['imap_host']}:{cfg['imap_port']}  SMTP: {cfg['smtp_host']}:{cfg['smtp_port']}")
-    print(f"Polling folders: {cfg.get('poll_folders', 'INBOX')} every {args.interval}s")
+    if cfg.get("email"):
+        print(f"Using account: {cfg['email']}")
+        print(f"IMAP: {cfg['imap_host']}:{cfg['imap_port']}  SMTP: {cfg['smtp_host']}:{cfg['smtp_port']}")
+        print(f"Polling folders: {cfg.get('poll_folders', 'INBOX')} every {args.interval}s")
 
     threading.Thread(
         target=run_server,
