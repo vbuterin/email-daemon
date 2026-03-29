@@ -432,7 +432,7 @@ def query_messages(
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        print(f"[{datetime.now().isoformat()}] {args[0]} {args[1]} {args[2]}")
+        print(f"[{datetime.now().isoformat()}] {' '.join(str(a) for a in args)}")
 
     def send_json(self, data: object, status: int = 200) -> None:
         body = json.dumps(data, indent=2, default=str).encode()
