@@ -1,44 +1,52 @@
 """
 email_daemon.py — IMAP email polling daemon with HTTP query interface.
 
-Mirrors the architecture of signal_daemon.py:
-  - Polls an IMAP mailbox on a configurable interval
-  - Stores messages in a local SQLite database
-  - Exposes a small HTTP API for querying and sending
-
-Supports any IMAP/SMTP provider. For Protonmail, use Protonmail Bridge
-(runs locally on 127.0.0.1:1143 IMAP / 127.0.0.1:1025 SMTP).
+Supports multiple email accounts. Accounts are stored as a JSON list in the
+SQLite config table under the key 'accounts'. The daemon runs and serves HTTP
+regardless of how many accounts are configured (including zero).
 
 Usage
 -----
-First run (saves credentials):
-    python email_daemon.py --imap-host 127.0.0.1 --imap-port 1143 \
-                           --smtp-host 127.0.0.1 --smtp-port 1025 \
-                           --email you@proton.me --password yourBridgePassword
+Add an account:
+    python email_daemon.py add \
+        --imap-host 127.0.0.1 --imap-port 1143 \
+        --smtp-host 127.0.0.1 --smtp-port 1025 \
+        --email you@proton.me --password yourBridgePassword
 
-Subsequent runs (uses stored config):
-    python email_daemon.py
+List configured accounts:
+    python email_daemon.py list
+
+Remove an account:
+    python email_daemon.py remove --email you@proton.me
+
+Run the daemon (uses stored accounts):
+    python email_daemon.py run
 
 HTTP endpoints (default port 6001)
 -----------------------------------
 GET /messages
+    ?account=  filter by account email address
     ?sender=   filter by From address (substring match)
     ?subject=  filter by subject (substring match)
     ?since=    ISO-8601 datetime, e.g. 2024-01-01T00:00:00
     ?until=    ISO-8601 datetime
-    ?folder=   mailbox folder (default: INBOX)
+    ?folder=   mailbox folder
     ?limit=    max rows to return (default: 100)
 
 GET /send
+    ?from=     sender account email (required if multiple accounts)
     ?to=       recipient address (required)
-    ?subject=  email subject (required)
+    ?subject=  email subject (default: "(no subject)")
     ?body=     message body (required)
 
 GET /folders
-    Lists all mailbox folders on the IMAP server.
+    ?account=  account email address (required if multiple accounts)
+
+GET /accounts
+    Lists all configured accounts (passwords omitted).
 
 GET /status
-    Returns daemon uptime, last poll time, message count, config summary.
+    Returns daemon uptime, last poll time, message count, account summary.
 """
 
 import asyncio
@@ -83,6 +91,7 @@ def init_db() -> sqlite3.Connection:
     db.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id           INTEGER PRIMARY KEY,
+            account      TEXT,
             uid          TEXT,
             folder       TEXT,
             message_id   TEXT,
@@ -94,30 +103,63 @@ def init_db() -> sqlite3.Connection:
             date_sent    TEXT,
             received_at  TEXT,
             raw_headers  TEXT,
-            UNIQUE(uid, folder)
+            UNIQUE(account, uid, folder)
         )
     """)
     db.commit()
     return db
 
 
-def get_config(db: sqlite3.Connection) -> dict:
-    rows = db.execute("SELECT key, value FROM config").fetchall()
-    return {k: v for k, v in rows}
+def load_accounts(db: sqlite3.Connection) -> list[dict]:
+    row = db.execute("SELECT value FROM config WHERE key='accounts'").fetchone()
+    if not row:
+        return []
+    return json.loads(row[0])
 
 
-def set_config(db: sqlite3.Connection, **kwargs) -> None:
-    for k, v in kwargs.items():
-        db.execute(
-            "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (k, str(v))
-        )
+def save_accounts(db: sqlite3.Connection, accounts: list[dict]) -> None:
+    db.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES ('accounts', ?)",
+        (json.dumps(accounts),),
+    )
     db.commit()
+
+
+# ── Account management ─────────────────────────────────────────────────────────
+
+def add_account(db: sqlite3.Connection, account: dict) -> None:
+    accounts = load_accounts(db)
+    accounts = [a for a in accounts if a["email"] != account["email"]]
+    accounts.append(account)
+    save_accounts(db, accounts)
+    print(f"Account saved: {account['email']}")
+
+
+def remove_account(db: sqlite3.Connection, email: str) -> None:
+    accounts = load_accounts(db)
+    before = len(accounts)
+    accounts = [a for a in accounts if a["email"] != email]
+    if len(accounts) == before:
+        print(f"Account not found: {email}")
+    else:
+        save_accounts(db, accounts)
+        print(f"Account removed: {email}")
+
+
+def get_account(accounts: list[dict], email: str | None) -> dict | None:
+    if not accounts:
+        return None
+    if email:
+        matches = [a for a in accounts if a["email"] == email]
+        return matches[0] if matches else None
+    if len(accounts) == 1:
+        return accounts[0]
+    return None  # ambiguous — caller must specify
 
 
 # ── Email helpers ──────────────────────────────────────────────────────────────
 
 def _decode_header_value(raw: str | bytes | None) -> str:
-    """Decode a (possibly encoded) email header value to a plain string."""
     if raw is None:
         return ""
     if isinstance(raw, bytes):
@@ -133,7 +175,6 @@ def _decode_header_value(raw: str | bytes | None) -> str:
 
 
 def _get_body(msg: email_lib.message.Message) -> tuple[str, str]:
-    """Extract (plain_text, html) bodies from a Message object."""
     plain, html = "", ""
     if msg.is_multipart():
         for part in msg.walk():
@@ -164,13 +205,12 @@ def _get_body(msg: email_lib.message.Message) -> tuple[str, str]:
 
 # ── IMAP connection ────────────────────────────────────────────────────────────
 
-def _imap_connect(cfg: dict) -> imaplib.IMAP4 | imaplib.IMAP4_SSL:
-    host = cfg["imap_host"]
-    port = int(cfg["imap_port"])
-    use_ssl = cfg.get("imap_ssl", "true").lower() == "true"
+def _imap_connect(acct: dict) -> imaplib.IMAP4 | imaplib.IMAP4_SSL:
+    host = acct["imap_host"]
+    port = int(acct["imap_port"])
+    use_ssl = acct.get("imap_ssl", "true").lower() == "true"
 
     if use_ssl:
-        # Protonmail Bridge uses a self-signed cert — disable verification for localhost
         if host in ("127.0.0.1", "localhost"):
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
@@ -181,18 +221,16 @@ def _imap_connect(cfg: dict) -> imaplib.IMAP4 | imaplib.IMAP4_SSL:
     else:
         conn = imaplib.IMAP4(host, port)
 
-    conn.login(cfg["email"], cfg["password"])
+    conn.login(acct["email"], acct["password"])
     return conn
 
 
 # ── Polling ────────────────────────────────────────────────────────────────────
 
-def fetch_new_messages(cfg: dict, folder: str = "INBOX") -> list[dict]:
-    """Fetch all unseen messages from the given folder."""
-    conn = _imap_connect(cfg)
+def fetch_new_messages(acct: dict, folder: str = "INBOX") -> list[dict]:
+    conn = _imap_connect(acct)
     try:
         conn.select(f'"{folder}"')
-        # Search for ALL messages; track by UID so we don't re-import
         _, data = conn.uid("search", None, "ALL")
         uids = data[0].split() if data[0] else []
 
@@ -200,7 +238,8 @@ def fetch_new_messages(cfg: dict, folder: str = "INBOX") -> list[dict]:
         known = {
             row[0]
             for row in db.execute(
-                "SELECT uid FROM messages WHERE folder = ?", (folder,)
+                "SELECT uid FROM messages WHERE account = ? AND folder = ?",
+                (acct["email"], folder),
             ).fetchall()
         }
         db.close()
@@ -215,16 +254,15 @@ def fetch_new_messages(cfg: dict, folder: str = "INBOX") -> list[dict]:
                 continue
             raw = msg_data[0][1]
             msg = email_lib.message_from_bytes(raw)
-
             plain, html = _get_body(msg)
-            recipients = _decode_header_value(msg.get("To", ""))
             messages.append(
                 {
+                    "account": acct["email"],
                     "uid": uid,
                     "folder": folder,
                     "message_id": msg.get("Message-ID", ""),
                     "sender": _decode_header_value(msg.get("From", "")),
-                    "recipients": recipients,
+                    "recipients": _decode_header_value(msg.get("To", "")),
                     "subject": _decode_header_value(msg.get("Subject", "")),
                     "body_plain": plain,
                     "body_html": html,
@@ -244,13 +282,13 @@ def store_messages(db: sqlite3.Connection, messages: list[dict]) -> int:
         try:
             db.execute(
                 """INSERT OR IGNORE INTO messages
-                   (uid, folder, message_id, sender, recipients, subject,
+                   (account, uid, folder, message_id, sender, recipients, subject,
                     body_plain, body_html, date_sent, received_at, raw_headers)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    m["uid"], m["folder"], m["message_id"], m["sender"],
-                    m["recipients"], m["subject"], m["body_plain"], m["body_html"],
-                    m["date_sent"], m["received_at"], m["raw_headers"],
+                    m["account"], m["uid"], m["folder"], m["message_id"],
+                    m["sender"], m["recipients"], m["subject"], m["body_plain"],
+                    m["body_html"], m["date_sent"], m["received_at"], m["raw_headers"],
                 ),
             )
             if db.execute("SELECT changes()").fetchone()[0]:
@@ -261,8 +299,8 @@ def store_messages(db: sqlite3.Connection, messages: list[dict]) -> int:
     return count
 
 
-def list_folders(cfg: dict) -> list[str]:
-    conn = _imap_connect(cfg)
+def list_folders(acct: dict) -> list[str]:
+    conn = _imap_connect(acct)
     try:
         _, folder_list = conn.list()
         folders = []
@@ -276,51 +314,47 @@ def list_folders(cfg: dict) -> list[str]:
         conn.logout()
 
 
-async def poll_loop(cfg: dict, interval: int = POLL_INTERVAL) -> None:
+async def poll_loop(interval: int = POLL_INTERVAL) -> None:
     global _last_poll
-    required = ["imap_host", "imap_port", "smtp_host", "smtp_port", "email", "password"]
     while True:
-        # Re-read config each iteration so credentials saved after startup are picked up
-        db_cfg = sqlite3.connect(DB_PATH)
-        cfg.update(get_config(db_cfg))
-        db_cfg.close()
+        db = sqlite3.connect(DB_PATH)
+        accounts = load_accounts(db)
+        db.close()
 
-        missing = [k for k in required if not cfg.get(k)]
-        if missing:
-            print(f"[{datetime.now(timezone.utc).isoformat()}] Warning: not configured ({', '.join(missing)}) — skipping poll.")
+        if not accounts:
+            print(f"[{datetime.now(timezone.utc).isoformat()}] No accounts configured — skipping poll.")
             await asyncio.sleep(interval)
             continue
 
-        folders_to_poll = cfg.get("poll_folders", "INBOX").split(",")
-        print(f"[{datetime.now(timezone.utc).isoformat()}] Polling mailbox…")
-        db = sqlite3.connect(DB_PATH)
-        total_new = 0
-        for folder in folders_to_poll:
-            folder = folder.strip()
-            try:
-                msgs = fetch_new_messages(cfg, folder=folder)
-                n = store_messages(db, msgs)
-                total_new += n
-                if n:
-                    print(f"  {folder}: {n} new message(s)")
-            except Exception as e:
-                print(f"  Error polling {folder}: {e}")
-        db.close()
+        print(f"[{datetime.now(timezone.utc).isoformat()}] Polling {len(accounts)} account(s)…")
+        for acct in accounts:
+            folders_to_poll = acct.get("poll_folders", "INBOX").split(",")
+            db = sqlite3.connect(DB_PATH)
+            for folder in folders_to_poll:
+                folder = folder.strip()
+                try:
+                    msgs = fetch_new_messages(acct, folder=folder)
+                    n = store_messages(db, msgs)
+                    if n:
+                        print(f"  {acct['email']} / {folder}: {n} new message(s)")
+                except Exception as e:
+                    print(f"  Error polling {acct['email']} / {folder}: {e}")
+            db.close()
+
         _last_poll = datetime.now(timezone.utc)
-        print(f"  Total new: {total_new}")
         await asyncio.sleep(interval)
 
 
 # ── Sending ────────────────────────────────────────────────────────────────────
 
-def send_email(cfg: dict, to: str, subject: str, body: str) -> None:
-    host = cfg["smtp_host"]
-    port = int(cfg["smtp_port"])
-    use_ssl = cfg.get("smtp_ssl", "false").lower() == "true"
-    use_tls = cfg.get("smtp_tls", "true").lower() == "true"
+def send_email(acct: dict, to: str, subject: str, body: str) -> None:
+    host = acct["smtp_host"]
+    port = int(acct["smtp_port"])
+    use_ssl = acct.get("smtp_ssl", "false").lower() == "true"
+    use_tls = acct.get("smtp_tls", "true").lower() == "true"
 
     msg = MIMEMultipart("alternative")
-    msg["From"] = cfg["email"]
+    msg["From"] = acct["email"]
     msg["To"] = to
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
@@ -339,13 +373,14 @@ def send_email(cfg: dict, to: str, subject: str, body: str) -> None:
             smtp.starttls()
 
     with smtp:
-        smtp.login(cfg["email"], cfg["password"])
-        smtp.sendmail(cfg["email"], to, msg.as_string())
+        smtp.login(acct["email"], acct["password"])
+        smtp.sendmail(acct["email"], to, msg.as_string())
 
 
 # ── HTTP query ─────────────────────────────────────────────────────────────────
 
 def query_messages(
+    account: str | None = None,
     sender: str | None = None,
     subject: str | None = None,
     since: str | None = None,
@@ -359,6 +394,9 @@ def query_messages(
     clauses: list[str] = []
     params: list = []
 
+    if account:
+        clauses.append("account = ?")
+        params.append(account)
     if sender:
         clauses.append("sender LIKE ?")
         params.append(f"%{sender}%")
@@ -381,7 +419,6 @@ def query_messages(
 
     rows = db.execute(sql, params).fetchall()
     db.close()
-    # Omit raw HTML and headers by default to keep responses lean
     result = []
     for r in rows:
         d = dict(r)
@@ -394,10 +431,6 @@ def query_messages(
 # ── HTTP server ────────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
-    def __init__(self, cfg: dict, *args, **kwargs):
-        self.cfg = cfg
-        super().__init__(*args, **kwargs)
-
     def log_message(self, fmt, *args):
         print(f"[{datetime.now().isoformat()}] {args[0]} {args[1]} {args[2]}")
 
@@ -423,6 +456,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": "'limit' must be an integer"}, 400)
                 return
             messages = query_messages(
+                account=first("account"),
                 sender=first("sender"),
                 subject=first("subject"),
                 since=first("since"),
@@ -433,27 +467,57 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"count": len(messages), "messages": messages})
 
         elif parsed.path == "/send":
+            db = sqlite3.connect(DB_PATH)
+            accounts = load_accounts(db)
+            db.close()
+            acct = get_account(accounts, first("from"))
+            if not acct:
+                self.send_json(
+                    {"error": "specify ?from= (or add an account first)" if not accounts
+                     else "specify ?from= to disambiguate between multiple accounts"},
+                    400,
+                )
+                return
             to = first("to")
-            subject = first("subject") or "(no subject)"
             body = first("body")
             if not to or not body:
                 self.send_json({"error": "missing 'to' or 'body' parameter"}, 400)
                 return
+            subject = first("subject") or "(no subject)"
             try:
-                send_email(self.cfg, to, subject, body)
-                self.send_json({"ok": True, "to": to, "subject": subject})
+                send_email(acct, to, subject, body)
+                self.send_json({"ok": True, "from": acct["email"], "to": to, "subject": subject})
             except Exception as e:
                 self.send_json({"error": str(e)}, 500)
 
         elif parsed.path == "/folders":
+            db = sqlite3.connect(DB_PATH)
+            accounts = load_accounts(db)
+            db.close()
+            acct = get_account(accounts, first("account"))
+            if not acct:
+                self.send_json(
+                    {"error": "specify ?account= (or add an account first)" if not accounts
+                     else "specify ?account= to disambiguate between multiple accounts"},
+                    400,
+                )
+                return
             try:
-                folders = list_folders(self.cfg)
-                self.send_json({"folders": folders})
+                folders = list_folders(acct)
+                self.send_json({"account": acct["email"], "folders": folders})
             except Exception as e:
                 self.send_json({"error": str(e)}, 500)
 
+        elif parsed.path == "/accounts":
+            db = sqlite3.connect(DB_PATH)
+            accounts = load_accounts(db)
+            db.close()
+            safe = [{k: v for k, v in a.items() if k != "password"} for a in accounts]
+            self.send_json({"count": len(safe), "accounts": safe})
+
         elif parsed.path == "/status":
             db = sqlite3.connect(DB_PATH)
+            accounts = load_accounts(db)
             count = db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
             db.close()
             uptime = (datetime.now(timezone.utc) - _start_time).total_seconds()
@@ -462,10 +526,7 @@ class Handler(BaseHTTPRequestHandler):
                     "uptime_seconds": int(uptime),
                     "last_poll": _last_poll.isoformat() if _last_poll else None,
                     "message_count": count,
-                    "imap_host": self.cfg.get("imap_host"),
-                    "imap_port": self.cfg.get("imap_port"),
-                    "email": self.cfg.get("email"),
-                    "poll_folders": self.cfg.get("poll_folders", "INBOX"),
+                    "accounts": [a["email"] for a in accounts],
                 }
             )
 
@@ -473,68 +534,78 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "Not found"}, 404)
 
 
-def run_server(cfg: dict) -> None:
-    def make_handler(*args, **kwargs):
-        return Handler(cfg, *args, **kwargs)
-
+def run_server() -> None:
     print(f"HTTP server listening on http://localhost:{PORT}")
-    HTTPServer(("127.0.0.1", PORT), make_handler).serve_forever()
+    HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser(description="IMAP email polling daemon")
-    p.add_argument("--imap-host", help="IMAP server hostname (e.g. 127.0.0.1 for Bridge)")
-    p.add_argument("--imap-port", type=int, help="IMAP port (Bridge default: 1143)")
-    p.add_argument("--imap-ssl", choices=["true", "false"], help="Use SSL for IMAP? (default: true)")
-    p.add_argument("--smtp-host", help="SMTP server hostname")
-    p.add_argument("--smtp-port", type=int, help="SMTP port (Bridge default: 1025)")
-    p.add_argument("--smtp-ssl", choices=["true", "false"], help="Use SSL for SMTP? (default: false)")
-    p.add_argument("--smtp-tls", choices=["true", "false"], help="Use STARTTLS for SMTP? (default: true)")
-    p.add_argument("--email", help="Your email address")
-    p.add_argument("--password", help="IMAP/SMTP password (Bridge password, not Protonmail login)")
-    p.add_argument("--poll-folders", default="INBOX", help="Comma-separated folders to poll (default: INBOX)")
-    p.add_argument("--interval", type=int, default=POLL_INTERVAL, help=f"Poll interval in seconds (default: {POLL_INTERVAL})")
-    p.add_argument("--port", type=int, default=PORT, help=f"HTTP server port (default: {PORT})")
+    sub = p.add_subparsers(dest="command")
+
+    # run (default)
+    run_p = sub.add_parser("run", help="Start the daemon (default)")
+    run_p.add_argument("--interval", type=int, default=POLL_INTERVAL)
+    run_p.add_argument("--port", type=int, default=PORT)
+
+    # add
+    add_p = sub.add_parser("add", help="Add or update an account")
+    add_p.add_argument("--email", required=True)
+    add_p.add_argument("--password", required=True)
+    add_p.add_argument("--imap-host", required=True)
+    add_p.add_argument("--imap-port", type=int, required=True)
+    add_p.add_argument("--imap-ssl", choices=["true", "false"], default="true")
+    add_p.add_argument("--smtp-host", required=True)
+    add_p.add_argument("--smtp-port", type=int, required=True)
+    add_p.add_argument("--smtp-ssl", choices=["true", "false"], default="false")
+    add_p.add_argument("--smtp-tls", choices=["true", "false"], default="true")
+    add_p.add_argument("--poll-folders", default="INBOX")
+
+    # remove
+    rm_p = sub.add_parser("remove", help="Remove an account")
+    rm_p.add_argument("--email", required=True)
+
+    # list
+    sub.add_parser("list", help="List configured accounts")
+
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     db = init_db()
-    cfg = get_config(db)
 
-    # Merge any CLI args into stored config
-    cli_overrides = {
-        "imap_host":     args.imap_host,
-        "imap_port":     str(args.imap_port) if args.imap_port else None,
-        "imap_ssl":      args.imap_ssl,
-        "smtp_host":     args.smtp_host,
-        "smtp_port":     str(args.smtp_port) if args.smtp_port else None,
-        "smtp_ssl":      args.smtp_ssl,
-        "smtp_tls":      args.smtp_tls,
-        "email":         args.email,
-        "password":      args.password,
-        "poll_folders":  args.poll_folders,
-    }
-    updates = {k: v for k, v in cli_overrides.items() if v is not None}
-    if updates:
-        set_config(db, **updates)
-        cfg.update(updates)
-        print(f"Config updated: {', '.join(k for k in updates if k != 'password')}")
+    if args.command == "add":
+        add_account(db, {
+            "email":        args.email,
+            "password":     args.password,
+            "imap_host":    args.imap_host,
+            "imap_port":    str(args.imap_port),
+            "imap_ssl":     args.imap_ssl,
+            "smtp_host":    args.smtp_host,
+            "smtp_port":    str(args.smtp_port),
+            "smtp_ssl":     args.smtp_ssl,
+            "smtp_tls":     args.smtp_tls,
+            "poll_folders": args.poll_folders,
+        })
+        db.close()
 
-    db.close()
+    elif args.command == "remove":
+        remove_account(db, args.email)
+        db.close()
 
-    if cfg.get("email"):
-        print(f"Using account: {cfg['email']}")
-        print(f"IMAP: {cfg['imap_host']}:{cfg['imap_port']}  SMTP: {cfg['smtp_host']}:{cfg['smtp_port']}")
-        print(f"Polling folders: {cfg.get('poll_folders', 'INBOX')} every {args.interval}s")
+    elif args.command == "list":
+        accounts = load_accounts(db)
+        db.close()
+        if not accounts:
+            print("No accounts configured.")
+        for a in accounts:
+            print(f"  {a['email']}  IMAP {a['imap_host']}:{a['imap_port']}  SMTP {a['smtp_host']}:{a['smtp_port']}  folders={a.get('poll_folders','INBOX')}")
 
-    threading.Thread(
-        target=run_server,
-        args=(cfg,),
-        daemon=True,
-    ).start()
-
-    asyncio.run(poll_loop(cfg, interval=args.interval))
+    else:  # run or no subcommand
+        interval = getattr(args, "interval", POLL_INTERVAL)
+        db.close()
+        threading.Thread(target=run_server, daemon=True).start()
+        asyncio.run(poll_loop(interval=interval))
