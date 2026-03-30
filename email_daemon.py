@@ -5,12 +5,20 @@ Supports multiple email accounts. Accounts are stored as a JSON list in the
 SQLite config table under the key 'accounts'. The daemon runs and serves HTTP
 regardless of how many accounts are configured (including zero).
 
+Two HTTP servers run:
+  Port 6001 — main API (safe to expose to untrusted software)
+  Port 7001 — confirmation UI (human-facing only; keep away from untrusted software)
+
+When /send is called with a recipient different from the sender, the email is
+held pending and a confirmation URL on port 7001 is returned. The human must
+open that URL in a browser and click "Send" to approve.
+
 Usage
 -----
 Add an account:
-    python email_daemon.py add \
-        --imap-host 127.0.0.1 --imap-port 1143 \
-        --smtp-host 127.0.0.1 --smtp-port 1025 \
+    python email_daemon.py add \\
+        --imap-host 127.0.0.1 --imap-port 1143 \\
+        --smtp-host 127.0.0.1 --smtp-port 1025 \\
         --email you@proton.me --password yourBridgePassword
 
 List configured accounts:
@@ -22,7 +30,7 @@ Remove an account:
 Run the daemon (uses stored accounts):
     python email_daemon.py run
 
-HTTP endpoints (default port 6001)
+HTTP endpoints (port 6001)
 -----------------------------------
 GET /messages
     ?account=  filter by account email address
@@ -38,6 +46,7 @@ GET /send
     ?to=       recipient address (required)
     ?subject=  email subject (default: "(no subject)")
     ?body=     message body (required)
+    Returns immediately. If to != from, returns a confirm_url instead of sending.
 
 GET /folders
     ?account=  account email address (required if multiple accounts)
@@ -47,13 +56,21 @@ GET /accounts
 
 GET /status
     Returns daemon uptime, last poll time, message count, account summary.
+
+Confirmation endpoints (port 7001 — human-facing only)
+-------------------------------------------------------
+GET /confirm?token=...   Show confirmation page
+GET /approve?token=...   Send the email
+GET /deny?token=...      Cancel the email
 """
 
 import asyncio
 import email as email_lib
+import html as html_lib
 import imaplib
 import json
 import os
+import secrets
 import smtplib
 import sqlite3
 import ssl
@@ -72,10 +89,16 @@ import argparse
 DAEMON_DIR = os.path.expanduser("~/.email_daemon")
 DB_PATH = os.path.join(DAEMON_DIR, "messages.db")
 PORT = 6001
+CONFIRM_PORT = 7001  # human-facing confirmation UI — keep this port away from untrusted software
 POLL_INTERVAL = 60  # seconds
 
 _start_time = datetime.now(timezone.utc)
 _last_poll: datetime | None = None
+
+# In-memory store of pending outbound emails awaiting confirmation
+# { token: { acct, to, subject, body, created_at } }
+_pending: dict[str, dict] = {}
+_pending_lock = threading.Lock()
 
 # ── Database ───────────────────────────────────────────────────────────────────
 
@@ -175,7 +198,7 @@ def _decode_header_value(raw: str | bytes | None) -> str:
 
 
 def _get_body(msg: email_lib.message.Message) -> tuple[str, str]:
-    plain, html = "", ""
+    plain, body_html = "", ""
     if msg.is_multipart():
         for part in msg.walk():
             ct = part.get_content_type()
@@ -189,18 +212,18 @@ def _get_body(msg: email_lib.message.Message) -> tuple[str, str]:
             text = payload.decode(charset, errors="replace")
             if ct == "text/plain" and not plain:
                 plain = text
-            elif ct == "text/html" and not html:
-                html = text
+            elif ct == "text/html" and not body_html:
+                body_html = text
     else:
         payload = msg.get_payload(decode=True)
         charset = msg.get_content_charset() or "utf-8"
         if payload:
             text = payload.decode(charset, errors="replace")
             if msg.get_content_type() == "text/html":
-                html = text
+                body_html = text
             else:
                 plain = text
-    return plain, html
+    return plain, body_html
 
 
 # ── IMAP connection ────────────────────────────────────────────────────────────
@@ -254,7 +277,7 @@ def fetch_new_messages(acct: dict, folder: str = "INBOX") -> list[dict]:
                 continue
             raw = msg_data[0][1]
             msg = email_lib.message_from_bytes(raw)
-            plain, html = _get_body(msg)
+            plain, body_html = _get_body(msg)
             messages.append(
                 {
                     "account": acct["email"],
@@ -265,7 +288,7 @@ def fetch_new_messages(acct: dict, folder: str = "INBOX") -> list[dict]:
                     "recipients": _decode_header_value(msg.get("To", "")),
                     "subject": _decode_header_value(msg.get("Subject", "")),
                     "body_plain": plain,
-                    "body_html": html,
+                    "body_html": body_html,
                     "date_sent": msg.get("Date", ""),
                     "received_at": datetime.now(timezone.utc).isoformat(),
                     "raw_headers": str(msg.items()),
@@ -428,7 +451,7 @@ def query_messages(
     return result
 
 
-# ── HTTP server ────────────────────────────────────────────────────────────────
+# ── Main API server (port 6001) ────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -484,11 +507,35 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": "missing 'to' or 'body' parameter"}, 400)
                 return
             subject = first("subject") or "(no subject)"
-            try:
-                send_email(acct, to, subject, body)
-                self.send_json({"ok": True, "from": acct["email"], "to": to, "subject": subject})
-            except Exception as e:
-                self.send_json({"error": str(e)}, 500)
+
+            # Sending to self: send immediately
+            if to.strip().lower() == acct["email"].strip().lower():
+                try:
+                    send_email(acct, to, subject, body)
+                    self.send_json({"ok": True, "from": acct["email"], "to": to, "subject": subject})
+                except Exception as e:
+                    self.send_json({"error": str(e)}, 500)
+            else:
+                # Sending to someone else: require human confirmation
+                token = secrets.token_urlsafe(32)
+                with _pending_lock:
+                    _pending[token] = {
+                        "acct": acct,
+                        "to": to,
+                        "subject": subject,
+                        "body": body,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                confirm_url = f"http://localhost:{CONFIRM_PORT}/confirm?token={token}"
+                print(f"[{datetime.now().isoformat()}] Confirmation required: {confirm_url}")
+                self.send_json({
+                    "pending": True,
+                    "confirm_url": confirm_url,
+                    "from": acct["email"],
+                    "to": to,
+                    "subject": subject,
+                    "message": "Open confirm_url in your browser to approve or deny this email.",
+                })
 
         elif parsed.path == "/folders":
             db = sqlite3.connect(DB_PATH)
@@ -521,11 +568,14 @@ class Handler(BaseHTTPRequestHandler):
             count = db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
             db.close()
             uptime = (datetime.now(timezone.utc) - _start_time).total_seconds()
+            with _pending_lock:
+                pending_count = len(_pending)
             self.send_json(
                 {
                     "uptime_seconds": int(uptime),
                     "last_poll": _last_poll.isoformat() if _last_poll else None,
                     "message_count": count,
+                    "pending_confirmations": pending_count,
                     "accounts": [a["email"] for a in accounts],
                 }
             )
@@ -534,9 +584,115 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "Not found"}, 404)
 
 
+# ── Confirmation server (port 7001, human-facing) ──────────────────────────────
+
+def _page(title: str, body_content: str) -> str:
+    e = html_lib.escape
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>{e(title)}</title>
+<style>
+  body {{ font-family: sans-serif; max-width: 640px; margin: 4em auto; padding: 0 1em; color: #111; }}
+  table {{ border-collapse: collapse; width: 100%; margin: 1.5em 0; }}
+  td {{ padding: 10px 12px; vertical-align: top; }}
+  tr:nth-child(even) {{ background: #f5f5f5; }}
+  .label {{ font-weight: bold; width: 80px; }}
+  .body-text {{ white-space: pre-wrap; font-family: monospace; font-size: 0.9em; }}
+  .actions {{ display: flex; gap: 1em; margin-top: 2em; }}
+  a.btn {{ padding: 12px 28px; text-decoration: none; border-radius: 6px; font-size: 1.05em; color: white; }}
+  a.send {{ background: #2563eb; }}
+  a.deny {{ background: #dc2626; }}
+  .meta {{ color: #888; font-size: 0.85em; margin-top: 2em; }}
+</style>
+</head><body>
+{body_content}
+</body></html>"""
+
+
+class ConfirmHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        print(f"[{datetime.now().isoformat()}] confirm: {' '.join(str(a) for a in args)}")
+
+    def send_html(self, content: str, status: int = 200) -> None:
+        data = content.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", len(data))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        token = qs.get("token", [None])[0]
+        e = html_lib.escape
+
+        if parsed.path == "/confirm":
+            if not token:
+                self.send_html(_page("Error", "<h2>Missing token</h2>"), 400)
+                return
+            with _pending_lock:
+                pending = _pending.get(token)
+            if not pending:
+                self.send_html(_page("Not found", "<h2>&#x274C; Not found</h2><p>This link is invalid or has already been used.</p>"), 404)
+                return
+            body_content = f"""
+<h2>&#x2709;&#xFE0F; Confirm outbound email</h2>
+<table>
+  <tr><td class="label">From</td><td>{e(pending['acct']['email'])}</td></tr>
+  <tr><td class="label">To</td><td>{e(pending['to'])}</td></tr>
+  <tr><td class="label">Subject</td><td>{e(pending['subject'])}</td></tr>
+  <tr><td class="label">Body</td><td class="body-text">{e(pending['body'])}</td></tr>
+</table>
+<div class="actions">
+  <a class="btn send" href="/approve?token={e(token)}">&#x2714; Send</a>
+  <a class="btn deny" href="/deny?token={e(token)}">&#x2716; Don't send</a>
+</div>
+<p class="meta">Requested at {e(pending['created_at'])}</p>"""
+            self.send_html(_page("Confirm send", body_content))
+
+        elif parsed.path == "/approve":
+            if not token:
+                self.send_html(_page("Error", "<h2>Missing token</h2>"), 400)
+                return
+            with _pending_lock:
+                pending = _pending.pop(token, None)
+            if not pending:
+                self.send_html(_page("Already handled", "<h2>&#x274C; Already handled</h2><p>This link is invalid or has already been used.</p>"), 404)
+                return
+            try:
+                send_email(pending["acct"], pending["to"], pending["subject"], pending["body"])
+                print(f"[{datetime.now().isoformat()}] Confirmed and sent to {pending['to']}")
+                body_content = f"<h2>&#x2705; Email sent</h2><p>Sent to <strong>{e(pending['to'])}</strong> &mdash; <em>{e(pending['subject'])}</em></p>"
+                self.send_html(_page("Sent", body_content))
+            except Exception as ex:
+                body_content = f"<h2>&#x274C; Send failed</h2><pre>{e(str(ex))}</pre>"
+                self.send_html(_page("Error", body_content), 500)
+
+        elif parsed.path == "/deny":
+            if not token:
+                self.send_html(_page("Error", "<h2>Missing token</h2>"), 400)
+                return
+            with _pending_lock:
+                pending = _pending.pop(token, None)
+            if not pending:
+                self.send_html(_page("Already handled", "<h2>&#x274C; Already handled</h2><p>This link is invalid or has already been used.</p>"), 404)
+                return
+            print(f"[{datetime.now().isoformat()}] Denied send to {pending['to']}")
+            body_content = f"<h2>&#x1F6AB; Cancelled</h2><p>The email to <strong>{e(pending['to'])}</strong> was not sent.</p>"
+            self.send_html(_page("Cancelled", body_content))
+
+        else:
+            self.send_html(_page("Not found", "<h1>Not found</h1>"), 404)
+
+
 def run_server() -> None:
-    print(f"HTTP server listening on http://localhost:{PORT}")
+    print(f"API server listening on http://localhost:{PORT}")
     HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+
+
+def run_confirm_server() -> None:
+    print(f"Confirmation server listening on http://localhost:{CONFIRM_PORT} (human-facing)")
+    HTTPServer(("127.0.0.1", CONFIRM_PORT), ConfirmHandler).serve_forever()
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -608,4 +764,5 @@ if __name__ == "__main__":
         interval = getattr(args, "interval", POLL_INTERVAL)
         db.close()
         threading.Thread(target=run_server, daemon=True).start()
+        threading.Thread(target=run_confirm_server, daemon=True).start()
         asyncio.run(poll_loop(interval=interval))
