@@ -16,6 +16,8 @@ A local HTTP daemon runs on `http://localhost:6001` and exposes five endpoints:
 
 Timestamps/dates use **ISO 8601** format (e.g. `2026-01-15T09:00:00`).
 
+**Important:** Sending to self completes immediately. Sending to anyone else returns a `confirm_url` that **must be shown to the user** — the email is not sent until the user opens that URL in their browser and clicks "Send".
+
 > **Warning:** Message responses can be very long. In many circumstances it is more efficient to save the output to a file and then search or chunk it rather than reading it directly:
 > ```bash
 > curl "http://localhost:6001/messages" > /tmp/messages.json
@@ -157,7 +159,31 @@ curl --get "http://localhost:6001/messages" \
 
 ## Sending Email
 
-### Send from a specific account
+### Send to self (no confirmation required)
+When `to` matches the sender account, the email is sent immediately.
+
+```bash
+curl --get "http://localhost:6001/send" \
+  --data-urlencode "from=bob@proton.me" \
+  --data-urlencode "to=bob@proton.me" \
+  --data-urlencode "subject=Note to self" \
+  --data-urlencode "body=Remember to do the thing."
+```
+
+### Response format (sent immediately)
+```json
+{
+  "ok": true,
+  "from": "bob@proton.me",
+  "to": "bob@proton.me",
+  "subject": "Note to self"
+}
+```
+
+---
+
+### Send to another person — requires user confirmation
+
 ```bash
 curl --get "http://localhost:6001/send" \
   --data-urlencode "from=bob@proton.me" \
@@ -166,25 +192,23 @@ curl --get "http://localhost:6001/send" \
   --data-urlencode "body=Hi Alice, this is Bob."
 ```
 
-Note that if the recipient is not the same account as the sender, this will not respond with the usual response (below), it will instead respond with a confirmation URL at localhost:7001. You must give the user this URL.
-
-### Send when only one account is configured (from= optional)
-```bash
-curl --get "http://localhost:6001/send" \
-  --data-urlencode "to=alice@example.com" \
-  --data-urlencode "subject=Hello" \
-  --data-urlencode "body=Hi Alice, this is Bob."
-```
-
-### Response format
+### Response format (confirmation required)
 ```json
 {
-  "ok": true,
+  "pending": true,
+  "confirm_url": "http://localhost:7001/confirm?token=...",
   "from": "bob@proton.me",
   "to": "alice@example.com",
-  "subject": "Hello"
+  "subject": "Hello",
+  "message": "Open confirm_url in your browser to approve or deny this email."
 }
 ```
+
+> **When you receive a `pending: true` response, you must present the `confirm_url` to the user.** The email has NOT been sent yet. The user must open the URL in their browser and click "Send" to approve, or "Don't send" to cancel. Do not silently discard the URL.
+
+### Notes
+- `from=` is optional when only one account is configured
+- `subject=` defaults to `(no subject)` if omitted
 
 ---
 
@@ -222,6 +246,7 @@ curl "http://localhost:6001/status"
   "uptime_seconds": 3600,
   "last_poll": "2026-03-28T23:37:07.163682+00:00",
   "message_count": 142,
+  "pending_confirmations": 0,
   "accounts": ["bob@proton.me", "alice@proton.me"]
 }
 ```
